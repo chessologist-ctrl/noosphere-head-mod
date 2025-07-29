@@ -30,6 +30,8 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
+user_last_message = {}
+
 @bot.event
 async def on_ready():
     print(f"\n✅ Logged in as {bot.user}")
@@ -56,6 +58,9 @@ async def on_message(message):
         full_complaint = complaint_text + attachments_text
         sheet.append_row([user_id, full_complaint, date, "", "", "", "", "", ""])
         await message.channel.send("📝 Your complaint has been recorded. Thank you!")
+
+        # Save last message for reply reference
+        user_last_message[user_id] = message
 
 # Slash Command: /announce
 @tree.command(name="announce", description="Send an announcement from the Google Doc")
@@ -134,24 +139,25 @@ async def check_reverts():
                     text_lines = [line for line in lines if not line.strip().startswith("http")]
                     attachment_urls = [line.strip() for line in lines if line.strip().startswith("http")]
 
-                    msg = None
+                    # Send text message first
+                    sent_msg = None
                     if text_lines:
-                        msg = await user.send("\n".join(text_lines))
+                        sent_msg = await user.send("\n".join(text_lines))
                     else:
-                        msg = await user.send("")
+                        sent_msg = await user.send("")
 
+                    # Then send each attachment
                     for url in attachment_urls:
                         async with aiohttp.ClientSession() as session:
                             async with session.get(url) as resp:
                                 if resp.status == 200:
                                     img_data = await resp.read()
                                     file = File(io.BytesIO(img_data), filename=url.split("/")[-1])
-                                    if msg:
-                                        await msg.reply(file=file)
+                                    if sent_msg:
+                                        await sent_msg.reply(file=file)
                                     else:
                                         await user.send(file=file)
 
-                    # ✅ Update column I = Revert Sent
                     sheet.update_cell(i + 2, 9, "done")
 
                 except Exception as e:
@@ -160,4 +166,7 @@ async def check_reverts():
     except Exception as e:
         print(f"❌ Error in check_reverts loop: {e}")
 
+# Flask keep_alive if needed
+from keep_alive import keep_alive
+keep_alive()
 bot.run(DISCORD_TOKEN)
