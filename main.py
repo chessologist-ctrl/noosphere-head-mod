@@ -1,32 +1,16 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from flask import Flask
 import asyncio
 import os
-import base64
 import json
 import io
 from datetime import datetime
 import gspread
-from flask import Flask
-from threading import Thread
 from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
 from dotenv import load_dotenv
-
-# ------------------ Flask Keep-Alive ------------------ #
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
-Thread(target=run_flask).start()
+import aiohttp
 
 # ------------------ Load ENV ------------------ #
 load_dotenv()
@@ -36,9 +20,6 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 # --- Get creds from environment variable --- #
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
-if creds_json is None:
-    raise Exception("GOOGLE_CREDS_JSON environment variable not set")
-
 creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, [
     'https://spreadsheets.google.com/feeds',
@@ -55,8 +36,8 @@ intents.guilds = True
 intents.message_content = True
 intents.dm_messages = True
 intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = app_commands.CommandTree(bot)
 
 # ------------------ DM Complaint Logger ------------------ #
 @bot.event
@@ -74,15 +55,14 @@ async def on_message(message):
             attachments_text += f"\n{attachment.url}"
 
         complaint = content + attachments_text
+        sheet.append_row([user_id, complaint, date, "", "", "", "", "", ""])
 
-        sheet.append_row([user_id, complaint, date, "", "", "", "", "", ""])  # Added extra column for Revert Sent
-
-        await message.reply("✅ Your complaint has been received. Thank you!")
+        await message.reply("✅ Your complaint has been received and recorded. Thank you!")
 
     await bot.process_commands(message)
 
 # ------------------ Revert Checker ------------------ #
-@tasks.loop(seconds=300)  # Every 5 minutes
+@tasks.loop(minutes=5)
 async def check_reverts():
     records = sheet.get_all_records()
     for i, row in enumerate(records):
@@ -90,7 +70,7 @@ async def check_reverts():
         revert_sent = row.get("Revert Sent")
         user_id = row.get("User Id")
 
-        if revert_message and revert_sent != "done":
+        if revert_message and revert_sent.strip().lower() != "done":
             try:
                 user = await bot.fetch_user(int(user_id))
 
@@ -98,13 +78,14 @@ async def check_reverts():
                 text_parts = []
                 files = []
                 for part in revert_message.split("\n"):
-                    if part.strip().startswith("http") and any(ext in part for ext in [".jpg", ".png", ".jpeg", ".gif"]):
+                    if part.strip().startswith("http") and any(ext in part.lower() for ext in [".jpg", ".png", ".jpeg", ".gif"]):
                         try:
-                            async with bot.http._HTTPClient__session.get(part.strip()) as resp:
-                                if resp.status == 200:
-                                    data = await resp.read()
-                                    file = discord.File(io.BytesIO(data), filename=part.strip().split("/")[-1])
-                                    files.append(file)
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(part.strip()) as resp:
+                                    if resp.status == 200:
+                                        data = await resp.read()
+                                        file = discord.File(io.BytesIO(data), filename=part.strip().split("/")[-1])
+                                        files.append(file)
                         except:
                             text_parts.append(part.strip())
                     else:
@@ -116,67 +97,36 @@ async def check_reverts():
 
                 sheet.update_cell(i + 2, 9, "done")  # Column I = 'Revert Sent'
             except Exception as e:
-                print(f"Failed to send revert to {user_id}: {e}")
+                print(f"❌ Failed to send revert to {user_id}: {e}")
 
-# ------------------ Announce Slash Command ------------------ #
-@tree.command(name="announce", description="Send formatted announcement from Google Doc")
-@app_commands.describe(channel="Channel to post in", roles="Mentioned roles (with @)")
-async def announce(interaction: discord.Interaction, channel: discord.TextChannel, roles: str):
-    await interaction.response.defer()
-
-    try:
-        service = build('docs', 'v1', credentials=creds)
-        doc = service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-
-        text = ""
-        images = []
-        for element in doc['body']['content']:
-            if 'paragraph' in element:
-                for el in element['paragraph'].get('elements', []):
-                    text += el.get('textRun', {}).get('content', '')
-            elif 'inlineObjectElement' in element:
-                obj_id = element['inlineObjectElement']['inlineObjectId']
-                obj = doc['inlineObjects'][obj_id]
-                img = obj['inlineObjectProperties']['embeddedObject']
-                if 'imageProperties' in img:
-                    images.append(img)
-
-        mention_text = " ".join([f"||{role}||" for role in roles.split()])
-        if images:
-            folder_service = build('drive', 'v3', credentials=creds)
-            media_files = []
-
-            for i, img in enumerate(images):
-                object_id = list(doc['inlineObjects'].keys())[i]
-                object_metadata = doc['inlineObjects'][object_id]
-                source_uri = object_metadata['inlineObjectProperties']['embeddedObject']['imageProperties']['contentUri']
-                request = folder_service.files().get_media(fileId=source_uri)
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                fh.seek(0)
-                media_files.append(discord.File(fh, filename=f'image_{i + 1}.png'))
-
-            await channel.send(content=mention_text + "\n" + text.strip(), files=media_files)
-        else:
-            embed = discord.Embed(description=text.strip(), color=0x2ecc71)
-            await channel.send(content=mention_text, embed=embed)
-
-        await interaction.followup.send("✅ Announcement sent!")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to send announcement: {e}")
-
-# ------------------ Prefix (!announce) version ------------------ #
+# ------------------ Announcement Slash & Prefix Command ------------------ #
 @bot.command(name="announce")
-async def prefix_announce(ctx, channel: discord.TextChannel, *, roles: str):
-    fake_interaction = type("FakeInteraction", (), {"response": ctx, "channel": ctx.channel, "followup": ctx, "user": ctx.author})
-    await announce(fake_interaction, channel, roles)
+async def announce_prefix(ctx):
+    await ctx.send("📢 Announcement command will soon support full doc embedding here too!")
 
-# ------------------ Bot Ready ------------------ #
+@bot.tree.command(name="announce", description="Send an announcement")
+async def announce_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("📢 Slash command for announcement is running!", ephemeral=True)
+
+# ------------------ Ready Event ------------------ #
 @bot.event
 async def on_ready():
-    print(f"✅ Bot is online as {bot.user}")
-    await tree.sync()
+    await bot.tree.sync()
     check_reverts.start()
+    print(f"✅ Logged in as {bot.user}")
+
+# ------------------ Flask Keep-Alive ------------------ #
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+# ------------------ Start Bot & Flask ------------------ #
+if __name__ == "__main__":
+    import threading
+    threading.Thread(target=run_flask).start()
+    bot.run(DISCORD_TOKEN)
