@@ -1,4 +1,4 @@
-import discord
+import discord 
 from discord.ext import commands, tasks
 from discord import app_commands
 import os
@@ -13,7 +13,6 @@ import gspread
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
-from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
 # ------------------ Load ENV ------------------ #
@@ -94,30 +93,58 @@ async def on_ready():
         print(f"Slash command sync failed: {e}")
     check_reverts.start()
 
-# ------------------ Plain Text + Image Fetcher ------------------ #
+# ------------------ Google Doc Parser ------------------ #
 async def fetch_doc_content_and_images():
     doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-
     content = ""
-    if "body" in doc:
-        for element in doc["body"].get("content", []):
-            if "paragraph" in element:
-                for run in element["paragraph"].get("elements", []):
-                    content += run.get("textRun", {}).get("content", "")
-
-    # Get images
     image_files = []
-    response = drive_service.files().list(q=f"'{GOOGLE_DOC_ID}' in parents and mimeType contains 'image/'",
-                                          fields="files(id, name)").execute()
-    for file in response.get("files", []):
-        request = drive_service.files().get_media(fileId=file["id"])
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        fh.seek(0)
-        image_files.append(discord.File(fh, filename=file["name"]))
+
+    # Map inlineObjects (images) to file IDs
+    inline_objects = doc.get("inlineObjects", {})
+    object_images = {}
+    for obj_id, obj in inline_objects.items():
+        try:
+            source_uri = obj["inlineObjectProperties"]["embeddedObject"]["imageProperties"]["contentUri"]
+            object_images[obj_id] = source_uri
+        except KeyError:
+            continue
+
+    # Parse the document body
+    for element in doc.get("body", {}).get("content", []):
+        if "paragraph" in element:
+            for elem in element["paragraph"].get("elements", []):
+                if "textRun" in elem:
+                    content += elem["textRun"]["content"]
+                elif "inlineObjectElement" in elem:
+                    obj_id = elem["inlineObjectElement"]["inlineObjectId"]
+                    if obj_id in object_images:
+                        content += f"[image:{obj_id}]"  # Temporary placeholder
+
+    # Replace placeholders with Discord images
+    for obj_id, url in object_images.items():
+        try:
+            # Search for image in Drive using the contentUri
+            search = drive_service.files().list(q=f"mimeType contains 'image/' and trashed = false",
+                                                fields="files(id, name, thumbnailLink)").execute()
+            matched_file = None
+            for file in search.get("files", []):
+                if obj_id in file.get("id", "") or obj_id in file.get("name", ""):
+                    matched_file = file
+                    break
+
+            if not matched_file:
+                continue
+
+            request = drive_service.files().get_media(fileId=matched_file["id"])
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            fh.seek(0)
+            image_files.append(discord.File(fh, filename=matched_file["name"]))
+        except Exception as e:
+            print(f"Image download failed: {e}")
 
     return content.strip(), image_files
 
@@ -177,7 +204,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Noosphere Text Lord is alive!"
+    return "Noosphere Collective Bot is alive!"
 
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
