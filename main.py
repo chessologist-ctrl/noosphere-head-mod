@@ -13,13 +13,13 @@ import io
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH")
+CREDS_JSON = os.getenv("CREDS_JSON")
 GOOGLE_DOC_ID = os.getenv("GOOGLE_DOC_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 # Google Sheets Setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_PATH, scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_JSON, scope)
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
