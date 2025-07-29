@@ -1,4 +1,4 @@
-import discord
+import discord 
 from discord.ext import commands, tasks
 import asyncio
 import os
@@ -10,8 +10,19 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
+
+# ------------------ Keep Alive (Flask Server) ------------------ #
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def keep_alive():
+    Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
 # ------------------ Load ENV ------------------ #
 load_dotenv()
@@ -103,9 +114,12 @@ async def check_reverts():
             except Exception as e:
                 print(f"Failed to send revert to {user_id}: {e}")
 
+# ------------------ Bot Online Event ------------------ #
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f"✅ Bot is online as {bot.user}")
     check_reverts.start()
 
+# ------------------ Run Everything ------------------ #
+keep_alive()
 bot.run(DISCORD_TOKEN)
