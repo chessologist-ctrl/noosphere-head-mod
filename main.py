@@ -105,7 +105,7 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
     content = ""
     image_files = []
 
-    # Map inlineObjects (images) to Drive file IDs
+    # Map inlineObjects (images) to Drive file IDs or raw image data
     inline_objects = doc.get("inlineObjects", {})
     object_images = {}
     for obj_id, obj in inline_objects.items():
@@ -117,7 +117,12 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
                 object_images[obj_id] = file_id_match
                 print(f"Found image with file ID: {file_id_match} from contentUri: {source_uri}")
             else:
-                print(f"Could not extract file ID from contentUri: {source_uri}")
+                print(f"Could not extract file ID from contentUri: {source_uri}, attempting raw data fetch")
+                # Fallback: Try to get image data directly from Docs API if available
+                image_data = obj.get("inlineObjectProperties", {}).get("embeddedObject", {}).get("imageProperties", {}).get("contentUri")
+                if image_data and image_data.startswith("http"):
+                    object_images[obj_id] = image_data  # Use raw URL as fallback
+                    print(f"Using raw image URL: {image_data}")
         except (KeyError, IndexError) as e:
             print(f"Error parsing contentUri for {obj_id}: {e}")
 
@@ -146,30 +151,34 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
                     if obj_id in object_images:
                         content += f"[image:{obj_id}]"  # Temporary placeholder
 
-    # Fetch images from Drive
-    for obj_id, file_id in object_images.items():
+    # Fetch images from Drive or raw URL
+    for obj_id, image_source in object_images.items():
         try:
-            request = drive_service.files().get_media(fileId=file_id)
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            fh.seek(0)
-            filename = f"image_{obj_id}.png"  # Default filename
-            image_files.append(discord.File(fh, filename=filename))
-            print(f"Successfully downloaded image {file_id}")
-        except Exception as e:
-            print(f"Failed to download image {file_id} from Drive: {e}")
-            # Fallback: Try direct URL if Drive fails (for debugging)
-            try:
-                async with bot.http.HTTPClient_session.get(f"https://drive.google.com/uc?export=download&id={file_id}") as resp:
-                    if resp.status == 200:
+            if image_source.startswith("http"):
+                # Try direct URL download as fallback
+                async with bot.http.HTTPClient_session.get(image_source) as resp:
+                    print(f"Fetching {image_source}, Status: {resp.status}, Content-Type: {resp.headers.get('content-type')}")
+                    if resp.status == 200 and resp.headers.get('content-type', '').startswith('image'):
                         data = await resp.read()
-                        image_files.append(discord.File(io.BytesIO(data), filename=f"image_{obj_id}.png"))
-                        print(f"Successfully downloaded image {file_id} via direct URL")
-            except Exception as e2:
-                print(f"Direct URL fallback failed for {file_id}: {e2}")
+                        filename = f"image_{obj_id}.png"
+                        image_files.append(discord.File(io.BytesIO(data), filename=filename))
+                        print(f"Successfully downloaded image {image_source} via URL")
+                    else:
+                        print(f"Failed to fetch {image_source}, Status: {resp.status}, Content-Type: {resp.headers.get('content-type')}")
+            else:
+                # Use Drive API for file ID
+                request = drive_service.files().get_media(fileId=image_source)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                fh.seek(0)
+                filename = f"image_{obj_id}.png"
+                image_files.append(discord.File(fh, filename=filename))
+                print(f"Successfully downloaded image {image_source} via Drive")
+        except Exception as e:
+            print(f"Failed to download image {image_source}: {e}")
 
     # Replace placeholders with empty string (images are handled separately)
     for obj_id in object_images.keys():
@@ -202,8 +211,8 @@ def check_rate_limit(user_id):
 
 # ------------------ /announce Slash Command ------------------
 @bot.tree.command(name="announce", description="Send an announcement from Google Docs")
-@app_commands.describe(channel="Choose the channel to send the announcement in", roles="Optional role mentions (e.g., @role or @role_id)")
-async def announce(interaction: discord.Interaction, channel: discord.TextChannel, roles: str = None):
+@app_commands.describe(channel="Choose the channel to send the announcement in")
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel):
     if not is_allowed(interaction):
         await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
         return
@@ -219,30 +228,8 @@ async def announce(interaction: discord.Interaction, channel: discord.TextChanne
             await interaction.followup.send("⚠ The document is empty.", ephemeral=True)
             return
 
-        # Parse roles from argument with debug
-        final_roles = []
-        if roles:
-            print(f"Parsing roles input: {roles}")  # Debug log
-            for part in roles.strip().split():
-                if part.startswith("@"):
-                    role_input = part[1:]  # Remove @
-                    role = None
-                    if role_input.isdigit():
-                        role_id = int(role_input)
-                        role = discord.utils.get(channel.guild.roles, id=role_id)
-                    else:
-                        role = discord.utils.get(channel.guild.roles, name=role_input)
-                    if role:
-                        final_roles.append(role.mention)
-                        print(f"Successfully added ping for {part}: {role.mention}")
-                    else:
-                        print(f"Failed to find role for {part} in guild")
-
-        roles_string = " ".join(final_roles) if final_roles else ""
-        final_message = f"{roles_string}\n{text}" if roles_string else text
-
         # Send text first, then images separately
-        await channel.send(content=final_message or None)
+        await channel.send(content=text or None)
         if image_files:
             await channel.send(files=image_files)
 
@@ -253,7 +240,7 @@ async def announce(interaction: discord.Interaction, channel: discord.TextChanne
 
 # ------------------ !announce Prefix Command ------------------
 @bot.command(name="announce")
-async def announce_cmd(ctx, channel: discord.TextChannel, *, roles: str = None):
+async def announce_cmd(ctx, channel: discord.TextChannel):
     if not is_allowed(ctx):
         await ctx.send("❌ You do not have permission to use this command.")
         return
@@ -268,30 +255,8 @@ async def announce_cmd(ctx, channel: discord.TextChannel, *, roles: str = None):
             await ctx.send("⚠ The document is empty.")
             return
 
-        # Parse roles from argument with debug
-        final_roles = []
-        if roles:
-            print(f"Parsing roles input: {roles}")  # Debug log
-            for part in roles.strip().split():
-                if part.startswith("@"):
-                    role_input = part[1:]  # Remove @
-                    role = None
-                    if role_input.isdigit():
-                        role_id = int(role_input)
-                        role = discord.utils.get(channel.guild.roles, id=role_id)
-                    else:
-                        role = discord.utils.get(channel.guild.roles, name=role_input)
-                    if role:
-                        final_roles.append(role.mention)
-                        print(f"Successfully added ping for {part}: {role.mention}")
-                    else:
-                        print(f"Failed to find role for {part} in guild")
-
-        roles_string = " ".join(final_roles) if final_roles else ""
-        final_message = f"{roles_string}\n{text}" if roles_string else text
-
         # Send text first, then images separately
-        await channel.send(content=final_message or None)
+        await channel.send(content=text or None)
         if image_files:
             await channel.send(files=image_files)
     except Exception as e:
