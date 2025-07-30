@@ -93,13 +93,13 @@ async def on_ready():
         print(f"Slash command sync failed: {e}")
     check_reverts.start()
 
-# ------------------ Google Doc Parser ------------------
-async def fetch_doc_content_and_images():
+# ------------------ Google Doc Parser with Role Handling ------------------
+async def fetch_doc_content_and_images(interaction=None, channel=None):
     doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
     content = ""
     image_files = []
 
-    # Map inlineObjects (images) to file URLs or Drive files
+    # Map inlineObjects (images) to file URLs
     inline_objects = doc.get("inlineObjects", {})
     object_images = {}
     for obj_id, obj in inline_objects.items():
@@ -114,7 +114,21 @@ async def fetch_doc_content_and_images():
         if "paragraph" in element:
             for elem in element["paragraph"].get("elements", []):
                 if "textRun" in elem:
-                    content += elem["textRun"]["content"]
+                    text = elem["textRun"]["content"]
+                    # Detect and convert role mentions from text
+                    if interaction and interaction.guild:
+                        guild = interaction.guild
+                    elif channel and channel.guild:
+                        guild = channel.guild
+                    else:
+                        guild = None
+                    if guild:
+                        for role in guild.roles:
+                            if f"@{role.name}" in text:
+                                text = text.replace(f"@{role.name}", role.mention)
+                            if f"@{role.id}" in text:
+                                text = text.replace(f"@{role.id}", role.mention)
+                    content += text
                 elif "inlineObjectElement" in elem:
                     obj_id = elem["inlineObjectElement"]["inlineObjectId"]
                     if obj_id in object_images:
@@ -123,34 +137,11 @@ async def fetch_doc_content_and_images():
     # Replace placeholders with Discord images
     for obj_id, url in object_images.items():
         try:
-            # Attempt to download directly from contentUri (Google-hosted image)
             async with bot.http.HTTPClient_session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.read()
                     filename = f"image_{obj_id}.png"  # Default filename
                     image_files.append(discord.File(io.BytesIO(data), filename=filename))
-                    continue
-
-            # Fallback: Search Drive for the image if direct download fails
-            search = drive_service.files().list(
-                q=f"mimeType contains 'image/' and trashed = false",
-                fields="files(id, name, thumbnailLink)"
-            ).execute()
-            matched_file = None
-            for file in search.get("files", []):
-                if obj_id in file.get("id", "") or obj_id in file.get("name", ""):
-                    matched_file = file
-                    break
-
-            if matched_file:
-                request = drive_service.files().get_media(fileId=matched_file["id"])
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                fh.seek(0)
-                image_files.append(discord.File(fh, filename=matched_file["name"] or f"image_{obj_id}.png"))
         except Exception as e:
             print(f"Image download failed for {obj_id}: {e}")
 
@@ -162,16 +153,34 @@ async def fetch_doc_content_and_images():
 
 # ------------------ /announce Slash Command ------------------
 @bot.tree.command(name="announce", description="Send an announcement from Google Docs")
-@app_commands.describe(channel="Choose the channel to send the announcement in")
-async def announce(interaction: discord.Interaction, channel: discord.TextChannel):
+@app_commands.describe(channel="Choose the channel to send the announcement in", roles="Optional role mentions (e.g., @role or @role_id)")
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel, roles: str = None):
     await interaction.response.defer(thinking=True)
     try:
-        text, image_files = await fetch_doc_content_and_images()
+        text, image_files = await fetch_doc_content_and_images(interaction, channel)
         if not text and not image_files:
             await interaction.followup.send("⚠ The document is empty.")
             return
 
-        await channel.send(content=text or None, files=image_files if image_files else None)  
+        # Parse roles from argument
+        final_roles = []
+        if roles:
+            for part in roles.strip().split():
+                if part.startswith("@") and part[1:].isdigit():
+                    role_id = int(part[1:])
+                    role = discord.utils.get(channel.guild.roles, id=role_id)
+                    if role:
+                        final_roles.append(role.mention)
+                elif part.startswith("@"):
+                    role_name = part[1:]
+                    role = discord.utils.get(channel.guild.roles, name=role_name)
+                    if role:
+                        final_roles.append(role.mention)
+
+        roles_string = " ".join(final_roles) if final_roles else ""
+        final_message = f"{roles_string}\n{text}" if roles_string else text
+
+        await channel.send(content=final_message or None, files=image_files if image_files else None)  
         await interaction.followup.send(f"✅ Announcement sent to {channel.mention}")  
     except Exception as e:  
         print(f"Error in /announce: {e}")  
@@ -179,14 +188,32 @@ async def announce(interaction: discord.Interaction, channel: discord.TextChanne
 
 # ------------------ !announce Prefix Command ------------------
 @bot.command(name="announce")
-async def announce_cmd(ctx):
+async def announce_cmd(ctx, channel: discord.TextChannel, *, roles: str = None):
     try:
-        text, image_files = await fetch_doc_content_and_images()
+        text, image_files = await fetch_doc_content_and_images(None, channel)
         if not text and not image_files:
             await ctx.send("⚠ The document is empty.")
             return
 
-        await ctx.send(content=text or None, files=image_files if image_files else None)  
+        # Parse roles from argument
+        final_roles = []
+        if roles:
+            for part in roles.strip().split():
+                if part.startswith("@") and part[1:].isdigit():
+                    role_id = int(part[1:])
+                    role = discord.utils.get(channel.guild.roles, id=role_id)
+                    if role:
+                        final_roles.append(role.mention)
+                elif part.startswith("@"):
+                    role_name = part[1:]
+                    role = discord.utils.get(channel.guild.roles, name=role_name)
+                    if role:
+                        final_roles.append(role.mention)
+
+        roles_string = " ".join(final_roles) if final_roles else ""
+        final_message = f"{roles_string}\n{text}" if roles_string else text
+
+        await channel.send(content=final_message or None, files=image_files if image_files else None)  
     except Exception as e:  
         print(f"Error in !announce: {e}")  
         await ctx.send("❌ Failed to send announcement.")
