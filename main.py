@@ -8,6 +8,7 @@ import io
 from datetime import datetime
 from flask import Flask
 import threading
+from collections import defaultdict
 
 import gspread
 from googleapiclient.discovery import build
@@ -21,6 +22,11 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_DOC_ID = os.getenv("GOOGLE_DOC_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
+
+# ------------------ Rate Limit Setup ------------------
+RATE_LIMIT = 10  # Adjusted to 10 uses per minute
+RATE_LIMIT_WINDOW = 60  # 1 minute in seconds
+usage_tracker = defaultdict(list)
 
 # ------------------ Google Auth ------------------
 if creds_json is None:
@@ -93,7 +99,7 @@ async def on_ready():
         print(f"Slash command sync failed: {e}")
     check_reverts.start()
 
-# ------------------ Google Doc Parser with Role Handling ------------------
+# ------------------ Google Doc Parser with Role and Image Handling ------------------
 async def fetch_doc_content_and_images(interaction=None, channel=None):
     doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
     content = ""
@@ -106,6 +112,7 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
         try:
             source_uri = obj["inlineObjectProperties"]["embeddedObject"]["imageProperties"]["contentUri"]
             object_images[obj_id] = source_uri
+            print(f"Found image with contentUri: {source_uri}")  # Debug log
         except KeyError:
             continue
 
@@ -138,12 +145,15 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
     for obj_id, url in object_images.items():
         try:
             async with bot.http.HTTPClient_session.get(url) as resp:
-                if resp.status == 200:
+                print(f"Fetching {url}, Status: {resp.status}, Headers: {resp.headers}, Content-Type: {resp.headers.get('content-type')}")  # Enhanced debug log
+                if resp.status == 200 and resp.headers.get('content-type', '').startswith('image'):
                     data = await resp.read()
                     filename = f"image_{obj_id}.png"  # Default filename
                     image_files.append(discord.File(io.BytesIO(data), filename=filename))
+                else:
+                    print(f"Failed to fetch {url}, Invalid status or content type")
         except Exception as e:
-            print(f"Image download failed for {obj_id}: {e}")
+            print(f"Image download failed for {url}: {e}")
 
     # Replace placeholders with empty string (images are handled separately)
     for obj_id in object_images.keys():
@@ -151,15 +161,46 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
 
     return content.strip(), image_files
 
+# ------------------ Permission Check ------------------
+ALLOWED_ROLE_IDS = {1397015557185867799, 123456789012345678}  # Replace with your comma-separated role IDs
+def is_allowed(interaction_or_ctx):
+    if isinstance(interaction_or_ctx, discord.Interaction):
+        user = interaction_or_ctx.user
+        member = interaction_or_ctx.guild.get_member(user.id)
+        if member and member.guild_permissions.administrator:
+            return True
+        return any(role.id in ALLOWED_ROLE_IDS for role in member.roles) if member else False
+    elif isinstance(interaction_or_ctx, commands.Context):
+        member = interaction_or_ctx.author
+        if member.guild_permissions.administrator:
+            return True
+        return any(role.id in ALLOWED_ROLE_IDS for role in member.roles)
+
+# ------------------ Rate Limit Check ------------------
+def check_rate_limit(user_id):
+    current_time = datetime.now().timestamp()
+    user_usage = usage_tracker[user_id]
+    user_usage = [t for t in user_usage if current_time - t < RATE_LIMIT_WINDOW]
+    usage_tracker[user_id] = user_usage
+    return len(user_usage) < RATE_LIMIT
+
 # ------------------ /announce Slash Command ------------------
 @bot.tree.command(name="announce", description="Send an announcement from Google Docs")
 @app_commands.describe(channel="Choose the channel to send the announcement in", roles="Optional role mentions (e.g., @role or @role_id)")
 async def announce(interaction: discord.Interaction, channel: discord.TextChannel, roles: str = None):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        return
+    user_id = str(interaction.user.id)
+    if not check_rate_limit(user_id):
+        await interaction.response.send_message("❌ Rate limit exceeded. Try again in 1 minute.", ephemeral=True)
+        return
+    usage_tracker[user_id].append(datetime.now().timestamp())
     await interaction.response.defer(thinking=True)
     try:
         text, image_files = await fetch_doc_content_and_images(interaction, channel)
         if not text and not image_files:
-            await interaction.followup.send("⚠ The document is empty.")
+            await interaction.followup.send("⚠ The document is empty.", ephemeral=True)
             return
 
         # Parse roles from argument
@@ -180,15 +221,27 @@ async def announce(interaction: discord.Interaction, channel: discord.TextChanne
         roles_string = " ".join(final_roles) if final_roles else ""
         final_message = f"{roles_string}\n{text}" if roles_string else text
 
-        await channel.send(content=final_message or None, files=image_files if image_files else None)  
-        await interaction.followup.send(f"✅ Announcement sent to {channel.mention}")  
-    except Exception as e:  
-        print(f"Error in /announce: {e}")  
-        await interaction.followup.send("❌ Failed to send announcement.")
+        # Send text first, then images separately
+        await channel.send(content=final_message or None)
+        if image_files:
+            await channel.send(files=image_files)
+
+        await interaction.followup.send(f"✅ Announcement sent to {channel.mention}", ephemeral=True)
+    except Exception as e:
+        print(f"Error in /announce: {e}")
+        await interaction.followup.send("❌ Failed to send announcement.", ephemeral=True)
 
 # ------------------ !announce Prefix Command ------------------
 @bot.command(name="announce")
 async def announce_cmd(ctx, channel: discord.TextChannel, *, roles: str = None):
+    if not is_allowed(ctx):
+        await ctx.send("❌ You do not have permission to use this command.")
+        return
+    user_id = str(ctx.author.id)
+    if not check_rate_limit(user_id):
+        await ctx.send("❌ Rate limit exceeded. Try again in 1 minute.")
+        return
+    usage_tracker[user_id].append(datetime.now().timestamp())
     try:
         text, image_files = await fetch_doc_content_and_images(None, channel)
         if not text and not image_files:
@@ -213,9 +266,12 @@ async def announce_cmd(ctx, channel: discord.TextChannel, *, roles: str = None):
         roles_string = " ".join(final_roles) if final_roles else ""
         final_message = f"{roles_string}\n{text}" if roles_string else text
 
-        await channel.send(content=final_message or None, files=image_files if image_files else None)  
-    except Exception as e:  
-        print(f"Error in !announce: {e}")  
+        # Send text first, then images separately
+        await channel.send(content=final_message or None)
+        if image_files:
+            await channel.send(files=image_files)
+    except Exception as e:
+        print(f"Error in !announce: {e}")
         await ctx.send("❌ Failed to send announcement.")
 
 # ------------------ DM Complaint Logger ------------------
