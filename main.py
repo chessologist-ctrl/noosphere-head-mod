@@ -1,215 +1,165 @@
-import discord 
+import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import os
-import json
-import asyncio
 import io
-from datetime import datetime
+import base64
 from flask import Flask
-import threading
-
+from threading import Thread
 import gspread
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
+from datetime import datetime
+import asyncio
+import json
 from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+import requests
 
-# ------------------ Load ENV ------------------ #
+# ------------------ ENV ------------------ #
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_DOC_ID = os.getenv("GOOGLE_DOC_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-creds_json = os.getenv("GOOGLE_CREDS_JSON")
+GOOGLE_CREDS_JSON = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
 
-# ------------------ Google Auth ------------------ #
-if creds_json is None:
-    raise Exception("GOOGLE_CREDS_JSON environment variable not set")
-
-creds_dict = json.loads(creds_json)
-creds = service_account.Credentials.from_service_account_info(
-    creds_dict,
-    scopes=['https://www.googleapis.com/auth/documents',
-            'https://www.googleapis.com/auth/drive',
-            'https://www.googleapis.com/auth/spreadsheets']
-)
-
-drive_service = build('drive', 'v3', credentials=creds)
-docs_service = build('docs', 'v1', credentials=creds)
-gc = gspread.authorize(creds)
-sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
-
-# ------------------ Discord Setup ------------------ #
 intents = discord.Intents.default()
 intents.messages = True
-intents.guilds = True
 intents.message_content = True
-intents.dm_messages = True
-intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree  # Slash commands
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# ------------------ GOOGLE SERVICES ------------------ #
+scope = ['https://www.googleapis.com/auth/documents.readonly', 'https://www.googleapis.com/auth/spreadsheets']
+creds = Credentials.from_service_account_info(GOOGLE_CREDS_JSON, scopes=scope)
+docs_service = build('docs', 'v1', credentials=creds)
+sheets_client = gspread.authorize(creds)
+sheet = sheets_client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-# ------------------ Revert Checker ------------------ #
-@tasks.loop(minutes=5)
-async def check_reverts():
-    records = sheet.get_all_records()
-    for i, row in enumerate(records):
-        revert_message = row.get("Revert")
-        revert_sent = row.get("Revert Sent")
-        user_id = row.get("User Id")
-
-        if revert_message and revert_sent != "done":
-            try:
-                user = await bot.fetch_user(int(user_id))
-
-                # Handle images
-                text_parts = []
-                files = []
-                for part in revert_message.split("\n"):
-                    if part.strip().startswith("http") and any(ext in part.lower() for ext in [".jpg", ".jpeg", ".png", ".gif"]):
-                        async with bot.http._HTTPClient__session.get(part.strip()) as resp:
-                            if resp.status == 200:
-                                data = await resp.read()
-                                file = discord.File(io.BytesIO(data), filename=part.strip().split("/")[-1])
-                                files.append(file)
-                    else:
-                        text_parts.append(part.strip())
-
-                message_text = "\n".join(text_parts)
-                await user.send(content=message_text or None, files=files if files else None)
-                sheet.update_cell(i + 2, 9, "done")  # Column I = 'Revert Sent'
-
-            except Exception as e:
-                print(f"Failed to send revert to {user_id}: {e}")
-
-# ------------------ On Ready ------------------ #
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} slash commands")
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
-    check_reverts.start()
-
-# ------------------ Google Doc Parser ------------------ #
-async def fetch_doc_content_and_images():
-    doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-    content = ""
-    image_files = []
-
-    # Map inlineObjects (images) to file IDs
-    inline_objects = doc.get("inlineObjects", {})
-    object_images = {}
-    for obj_id, obj in inline_objects.items():
-        try:
-            source_uri = obj["inlineObjectProperties"]["embeddedObject"]["imageProperties"]["contentUri"]
-            object_images[obj_id] = source_uri
-        except KeyError:
-            continue
-
-    # Parse the document body
-    for element in doc.get("body", {}).get("content", []):
-        if "paragraph" in element:
-            for elem in element["paragraph"].get("elements", []):
-                if "textRun" in elem:
-                    content += elem["textRun"]["content"]
-                elif "inlineObjectElement" in elem:
-                    obj_id = elem["inlineObjectElement"]["inlineObjectId"]
-                    if obj_id in object_images:
-                        content += f"[image:{obj_id}]"  # Temporary placeholder
-
-    # Replace placeholders with Discord images
-    for obj_id, url in object_images.items():
-        try:
-            # Search for image in Drive using the contentUri
-            search = drive_service.files().list(q=f"mimeType contains 'image/' and trashed = false",
-                                                fields="files(id, name, thumbnailLink)").execute()
-            matched_file = None
-            for file in search.get("files", []):
-                if obj_id in file.get("id", "") or obj_id in file.get("name", ""):
-                    matched_file = file
-                    break
-
-            if not matched_file:
-                continue
-
-            request = drive_service.files().get_media(fileId=matched_file["id"])
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            fh.seek(0)
-            image_files.append(discord.File(fh, filename=matched_file["name"]))
-        except Exception as e:
-            print(f"Image download failed: {e}")
-
-    return content.strip(), image_files
-
-# ------------------ /announce Slash Command ------------------ #
-@bot.tree.command(name="announce", description="Send an announcement from Google Docs")
-@app_commands.describe(channel="Choose the channel to send the announcement in")
-async def announce(interaction: discord.Interaction, channel: discord.TextChannel):
-    await interaction.response.defer(thinking=True)
-    try:
-        text, image_files = await fetch_doc_content_and_images()
-        if not text:
-            await interaction.followup.send("⚠️ The document is empty.")
-            return
-
-        await channel.send(content=text, files=image_files if image_files else None)
-        await interaction.followup.send(f"✅ Announcement sent to {channel.mention}")
-    except Exception as e:
-        print(f"Error in /announce: {e}")
-        await interaction.followup.send("❌ Failed to send announcement.")
-
-# ------------------ !announce Prefix Command ------------------ #
-@bot.command(name="announce")
-async def announce_cmd(ctx):
-    try:
-        text, image_files = await fetch_doc_content_and_images()
-        if not text:
-            await ctx.send("⚠️ The document is empty.")
-            return
-
-        await ctx.send(content=text, files=image_files if image_files else None)
-    except Exception as e:
-        print(f"Error in !announce: {e}")
-        await ctx.send("❌ Failed to send announcement.")
-
-# ------------------ DM Complaint Logger ------------------ #
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-
-    if isinstance(message.channel, discord.DMChannel):
-        user_id = str(message.author.id)
-        content = message.content
-        date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        attachments_text = ""
-        for attachment in message.attachments:
-            attachments_text += f"\n{attachment.url}"
-
-        complaint = content + attachments_text
-        sheet.append_row([user_id, complaint, date, "", "", "", "", "", ""])
-        await message.reply("✅ Your complaint has been received. Thank you!")
-
-    await bot.process_commands(message)
-
-# ------------------ Flask Keep-Alive ------------------ #
+# ------------------ FLASK KEEP ALIVE ------------------ #
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Noosphere Collective Bot is alive!"
+    return "Noosphere Bot is Live!"
 
-def run_flask():
+def run():
     app.run(host='0.0.0.0', port=8080)
 
-threading.Thread(target=run_flask).start()
+def keep_alive():
+    Thread(target=run).start()
 
-# ------------------ Bot Run ------------------ #
+# ------------------ GET DOC CONTENT & IMAGES ------------------ #
+async def fetch_doc_content_and_images():
+    doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
+    content = ""
+    images = []
+
+    def read_structural_elements(elements):
+        nonlocal content, images
+        for value in elements:
+            if 'paragraph' in value:
+                elements = value['paragraph']['elements']
+                for elem in elements:
+                    text_run = elem.get('textRun')
+                    if text_run:
+                        content += text_run['content']
+            if 'inlineObjectElement' in value:
+                obj_id = value['inlineObjectElement']['inlineObjectId']
+                obj = doc['inlineObjects'][obj_id]
+                img = obj['inlineObjectProperties']['embeddedObject']
+                if 'imageProperties' in img:
+                    img_source = img['imageProperties']['contentUri']
+                    images.append(img_source)
+
+    body = doc.get('body').get('content')
+    read_structural_elements(body)
+
+    return content.strip(), images
+
+# ------------------ COMPLAINT SYSTEM ------------------ #
+@bot.event
+async def on_message(message):
+    if message.guild is None and not message.author.bot:
+        user_id = str(message.author.id)
+        text = message.content
+        date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        attachments_text = ""
+        for attachment in message.attachments:
+            attachments_text += f"{attachment.url}\n"
+
+        complaint = f"{text}\n{attachments_text}".strip()
+        sheet.append_row([user_id, complaint, date, "", "", "", "", ""])
+        await message.channel.send("✅ Your complaint has been received.")
+
+    await bot.process_commands(message)
+
+# ------------------ REVERT CHECK LOOP ------------------ #
+@tasks.loop(minutes=5)
+async def check_reverts():
+    records = sheet.get_all_records()
+    for i, row in enumerate(records, start=2):  # skip header
+        if row.get("Revert") and row.get("Revert Sent") != "done":
+            user_id = row["User Id"]
+            message = row["Revert"]
+
+            try:
+                user = await bot.fetch_user(int(user_id))
+                # Handle attachments if present in Revert
+                urls = [x.strip() for x in message.split() if x.startswith("http")]
+                text = "\n".join([x for x in message.split("\n") if not x.strip().startswith("http")])
+
+                files = []
+                for url in urls:
+                    response = requests.get(url)
+                    if response.status_code == 200:
+                        file_bytes = io.BytesIO(response.content)
+                        filename = url.split("/")[-1]
+                        files.append(discord.File(file_bytes, filename=filename))
+
+                await user.send(content=text, files=files)
+                sheet.update_cell(i, 9, "done")  # Revert Sent column (I)
+            except Exception as e:
+                print(f"Error sending revert to {user_id}: {e}")
+
+# ------------------ ANNOUNCE COMMAND ------------------ #
+@tree.command(name="announce", description="Send announcement from Google Doc")
+@app_commands.describe(channel="Channel to send the announcement in")
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.send_message("📡 Sending announcement...", ephemeral=True)
+
+    text, image_urls = await fetch_doc_content_and_images()
+
+    # Mention formatting: Replace role names with actual mentions if they exist
+    for role in interaction.guild.roles:
+        if f"@{role.name}" in text:
+            text = text.replace(f"@{role.name}", role.mention)
+
+    files = []
+    for url in image_urls:
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                image_bytes = io.BytesIO(response.content)
+                filename = url.split("/")[-1].split("?")[0]
+                files.append(discord.File(image_bytes, filename=filename))
+        except Exception as e:
+            print(f"Failed to fetch image: {e}")
+
+    await channel.send(content=text, files=files)
+
+# ------------------ !announce PREFIX ------------------ #
+@bot.command(name="announce")
+async def announce_prefix(ctx):
+    await ctx.send("⚡ Use the /announce slash command to select the channel!")
+
+# ------------------ EVENTS ------------------ #
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"✅ Bot is online as {bot.user}")
+    check_reverts.start()
+
+# ------------------ STARTUP ------------------ #
+keep_alive()
 bot.run(DISCORD_TOKEN)
