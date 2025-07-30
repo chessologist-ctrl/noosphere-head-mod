@@ -24,7 +24,7 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
 
 # ------------------ Rate Limit Setup ------------------
-RATE_LIMIT = 10  # Adjusted to 10 uses per minute
+RATE_LIMIT = 10  # 10 uses per minute
 RATE_LIMIT_WINDOW = 60  # 1 minute in seconds
 usage_tracker = defaultdict(list)
 
@@ -105,16 +105,21 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
     content = ""
     image_files = []
 
-    # Map inlineObjects (images) to file URLs
+    # Map inlineObjects (images) to Drive file IDs
     inline_objects = doc.get("inlineObjects", {})
     object_images = {}
     for obj_id, obj in inline_objects.items():
         try:
             source_uri = obj["inlineObjectProperties"]["embeddedObject"]["imageProperties"]["contentUri"]
-            object_images[obj_id] = source_uri
-            print(f"Found image with contentUri: {source_uri}")  # Debug log
-        except KeyError:
-            continue
+            # Extract file ID from contentUri (e.g., id=FILE_ID in the URL)
+            file_id_match = source_uri.split("id=")[-1].split("&")[0] if "id=" in source_uri else None
+            if file_id_match:
+                object_images[obj_id] = file_id_match
+                print(f"Found image with file ID: {file_id_match} from contentUri: {source_uri}")
+            else:
+                print(f"Could not extract file ID from contentUri: {source_uri}")
+        except (KeyError, IndexError) as e:
+            print(f"Error parsing contentUri for {obj_id}: {e}")
 
     # Parse the document body
     for element in doc.get("body", {}).get("content", []):
@@ -141,19 +146,30 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
                     if obj_id in object_images:
                         content += f"[image:{obj_id}]"  # Temporary placeholder
 
-    # Replace placeholders with Discord images
-    for obj_id, url in object_images.items():
+    # Fetch images from Drive
+    for obj_id, file_id in object_images.items():
         try:
-            async with bot.http.HTTPClient_session.get(url) as resp:
-                print(f"Fetching {url}, Status: {resp.status}, Headers: {resp.headers}, Content-Type: {resp.headers.get('content-type')}")  # Enhanced debug log
-                if resp.status == 200 and resp.headers.get('content-type', '').startswith('image'):
-                    data = await resp.read()
-                    filename = f"image_{obj_id}.png"  # Default filename
-                    image_files.append(discord.File(io.BytesIO(data), filename=filename))
-                else:
-                    print(f"Failed to fetch {url}, Invalid status or content type")
+            request = drive_service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            fh.seek(0)
+            filename = f"image_{obj_id}.png"  # Default filename
+            image_files.append(discord.File(fh, filename=filename))
+            print(f"Successfully downloaded image {file_id}")
         except Exception as e:
-            print(f"Image download failed for {url}: {e}")
+            print(f"Failed to download image {file_id} from Drive: {e}")
+            # Fallback: Try direct URL if Drive fails (for debugging)
+            try:
+                async with bot.http.HTTPClient_session.get(f"https://drive.google.com/uc?export=download&id={file_id}") as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        image_files.append(discord.File(io.BytesIO(data), filename=f"image_{obj_id}.png"))
+                        print(f"Successfully downloaded image {file_id} via direct URL")
+            except Exception as e2:
+                print(f"Direct URL fallback failed for {file_id}: {e2}")
 
     # Replace placeholders with empty string (images are handled separately)
     for obj_id in object_images.keys():
@@ -203,20 +219,24 @@ async def announce(interaction: discord.Interaction, channel: discord.TextChanne
             await interaction.followup.send("⚠ The document is empty.", ephemeral=True)
             return
 
-        # Parse roles from argument
+        # Parse roles from argument with debug
         final_roles = []
         if roles:
+            print(f"Parsing roles input: {roles}")  # Debug log
             for part in roles.strip().split():
-                if part.startswith("@") and part[1:].isdigit():
-                    role_id = int(part[1:])
-                    role = discord.utils.get(channel.guild.roles, id=role_id)
+                if part.startswith("@"):
+                    role_input = part[1:]  # Remove @
+                    role = None
+                    if role_input.isdigit():
+                        role_id = int(role_input)
+                        role = discord.utils.get(channel.guild.roles, id=role_id)
+                    else:
+                        role = discord.utils.get(channel.guild.roles, name=role_input)
                     if role:
                         final_roles.append(role.mention)
-                elif part.startswith("@"):
-                    role_name = part[1:]
-                    role = discord.utils.get(channel.guild.roles, name=role_name)
-                    if role:
-                        final_roles.append(role.mention)
+                        print(f"Successfully added ping for {part}: {role.mention}")
+                    else:
+                        print(f"Failed to find role for {part} in guild")
 
         roles_string = " ".join(final_roles) if final_roles else ""
         final_message = f"{roles_string}\n{text}" if roles_string else text
@@ -248,20 +268,24 @@ async def announce_cmd(ctx, channel: discord.TextChannel, *, roles: str = None):
             await ctx.send("⚠ The document is empty.")
             return
 
-        # Parse roles from argument
+        # Parse roles from argument with debug
         final_roles = []
         if roles:
+            print(f"Parsing roles input: {roles}")  # Debug log
             for part in roles.strip().split():
-                if part.startswith("@") and part[1:].isdigit():
-                    role_id = int(part[1:])
-                    role = discord.utils.get(channel.guild.roles, id=role_id)
+                if part.startswith("@"):
+                    role_input = part[1:]  # Remove @
+                    role = None
+                    if role_input.isdigit():
+                        role_id = int(role_input)
+                        role = discord.utils.get(channel.guild.roles, id=role_id)
+                    else:
+                        role = discord.utils.get(channel.guild.roles, name=role_input)
                     if role:
                         final_roles.append(role.mention)
-                elif part.startswith("@"):
-                    role_name = part[1:]
-                    role = discord.utils.get(channel.guild.roles, name=role_name)
-                    if role:
-                        final_roles.append(role.mention)
+                        print(f"Successfully added ping for {part}: {role.mention}")
+                    else:
+                        print(f"Failed to find role for {part} in guild")
 
         roles_string = " ".join(final_roles) if final_roles else ""
         final_message = f"{roles_string}\n{text}" if roles_string else text
