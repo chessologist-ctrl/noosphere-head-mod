@@ -15,6 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 from dotenv import load_dotenv
+import requests
 
 # ------------------ Load ENV ------------------
 load_dotenv()
@@ -35,8 +36,8 @@ if creds_json is None:
 creds_dict = json.loads(creds_json)
 creds = service_account.Credentials.from_service_account_info(
     creds_dict,
-    scopes=['https://www.googleapis.com/auth/documents',
-            'https://www.googleapis.com/auth/drive',
+    scopes=['https://www.googleapis.com/auth/documents.readonly',
+            'https://www.googleapis.com/auth/drive.readonly',
             'https://www.googleapis.com/auth/spreadsheets']
 )
 
@@ -105,26 +106,16 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
     content = ""
     image_files = []
 
-    # Map inlineObjects (images) to Drive file IDs or raw image data
+    # Map inlineObjects (images) to contentUri
     inline_objects = doc.get("inlineObjects", {})
     object_images = {}
     for obj_id, obj in inline_objects.items():
         try:
             source_uri = obj["inlineObjectProperties"]["embeddedObject"]["imageProperties"]["contentUri"]
-            # Extract file ID from contentUri (e.g., id=FILE_ID in the URL)
-            file_id_match = source_uri.split("id=")[-1].split("&")[0] if "id=" in source_uri else None
-            if file_id_match:
-                object_images[obj_id] = file_id_match
-                print(f"Found image with file ID: {file_id_match} from contentUri: {source_uri}")
-            else:
-                print(f"Could not extract file ID from contentUri: {source_uri}, attempting raw data fetch")
-                # Fallback: Try to get image data directly from Docs API if available
-                image_data = obj.get("inlineObjectProperties", {}).get("embeddedObject", {}).get("imageProperties", {}).get("contentUri")
-                if image_data and image_data.startswith("http"):
-                    object_images[obj_id] = image_data  # Use raw URL as fallback
-                    print(f"Using raw image URL: {image_data}")
-        except (KeyError, IndexError) as e:
-            print(f"Error parsing contentUri for {obj_id}: {e}")
+            object_images[obj_id] = source_uri
+            print(f"Found image with contentUri: {source_uri}")
+        except KeyError:
+            continue
 
     # Parse the document body
     for element in doc.get("body", {}).get("content", []):
@@ -151,34 +142,39 @@ async def fetch_doc_content_and_images(interaction=None, channel=None):
                     if obj_id in object_images:
                         content += f"[image:{obj_id}]"  # Temporary placeholder
 
-    # Fetch images from Drive or raw URL
-    for obj_id, image_source in object_images.items():
+    # Fetch images using requests with authenticated headers
+    for obj_id, url in object_images.items():
         try:
-            if image_source.startswith("http"):
-                # Try direct URL download as fallback
-                async with bot.http.HTTPClient_session.get(image_source) as resp:
-                    print(f"Fetching {image_source}, Status: {resp.status}, Content-Type: {resp.headers.get('content-type')}")
-                    if resp.status == 200 and resp.headers.get('content-type', '').startswith('image'):
-                        data = await resp.read()
-                        filename = f"image_{obj_id}.png"
-                        image_files.append(discord.File(io.BytesIO(data), filename=filename))
-                        print(f"Successfully downloaded image {image_source} via URL")
-                    else:
-                        print(f"Failed to fetch {image_source}, Status: {resp.status}, Content-Type: {resp.headers.get('content-type')}")
+            # Add authorization header using service account token
+            access_token = creds.token
+            headers = {"Authorization": f"Bearer {access_token}"}
+            response = requests.get(url, headers=headers, timeout=10)
+            print(f"Fetching {url}, Status: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+            if response.status_code == 200 and response.headers.get('content-type', '').startswith('image'):
+                data = response.content
+                ext = response.headers['content-type'].split('/')[-1]
+                filename = f"image_{obj_id}.{ext}"
+                image_files.append(discord.File(io.BytesIO(data), filename=filename))
+                print(f"Successfully downloaded image {url}")
             else:
-                # Use Drive API for file ID
-                request = drive_service.files().get_media(fileId=image_source)
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                fh.seek(0)
-                filename = f"image_{obj_id}.png"
-                image_files.append(discord.File(fh, filename=filename))
-                print(f"Successfully downloaded image {image_source} via Drive")
+                print(f"Failed to fetch {url}, Status: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
         except Exception as e:
-            print(f"Failed to download image {image_source}: {e}")
+            print(f"Image download failed for {url}: {e}")
+            # Fallback: Try Drive API if URL fails
+            try:
+                file_id = url.split("id=")[-1].split("&")[0] if "id=" in url else None
+                if file_id:
+                    request = drive_service.files().get_media(fileId=file_id)
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                    fh.seek(0)
+                    image_files.append(discord.File(fh, filename=f"image_{obj_id}.png"))
+                    print(f"Successfully downloaded image {file_id} via Drive")
+            except Exception as e2:
+                print(f"Drive fallback failed for {url}: {e2}")
 
     # Replace placeholders with empty string (images are handled separately)
     for obj_id in object_images.keys():
